@@ -280,6 +280,8 @@ The child runs in the *same* worker and vm context under its own globals, so it 
 
 ### Where files live
 
+Other extensions can observe workflow start, typed progress batches and the full final result through `subagents:workflow:*` events. This includes `phase()` and `log()` records, without granting the script filesystem access. See [Observing workflows](rpc.md#observing-workflows) for payloads and a JSON-lines recorder example. The event stream is live and is not saved unless a subscriber records it.
+
 | What | Where |
 |---|---|
 | An inline script, as run | `<tmp>/pi-subagents-<uid>/<encoded-cwd>/<session>/tasks/<run id>.workflow.js` |
@@ -411,7 +413,7 @@ Concurrency is capped at `max(1, min(16, cpus - 2))`. Queued agents start as slo
 - **No UI that lists or launches saved workflows.** The inspector shows this session's runs.
 - **No scheduled workflows.** The scheduler runs agents, not workflows.
 - **Results are not persisted** beyond the journal and the transcript card.
-- **No driving one from another extension.** A workflow cannot be started or steered over the `pi.events` bus, and its agents are invisible to the RPC surface — they emit no lifecycle events, and `subagents:rpc:stop` refuses them. See [`rpc.md`](rpc.md).
+- **No driving one from another extension.** A workflow cannot be started or steered over the `pi.events` bus. It emits observation-only `subagents:workflow:*` events; its agents remain invisible to the RPC control surface, and `subagents:rpc:stop` refuses them. See [`rpc.md`](rpc.md#observing-workflows).
 
 The sandbox is a determinism and accident boundary, not a defence against a deliberately hostile script: the injected globals are host closures, and disabled code generation is what actually stops one being used to compile anything.
 

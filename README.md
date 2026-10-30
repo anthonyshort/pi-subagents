@@ -807,6 +807,10 @@ Agent lifecycle events are emitted via `pi.events.emit()` so other extensions ca
 
 | Event | When | Key fields |
 |-------|------|------------|
+| `subagents:workflow:started` | A tool or CLI workflow run starts | `id`, `name`, `sessionId`, `cwd`, `startedAt`; optional `args`, `scriptPath`, `toolCallId`, `resumedFrom` |
+| `subagents:workflow:progress` | A workflow produces a batch of typed progress records | `id`, `name`, `sessionId`, `cwd`, `entries` (`workflow_phase`, `workflow_agent`, `workflow_log`) |
+| `subagents:workflow:completed` | A workflow returns successfully | `id`, `name`, `sessionId`, `cwd`, `status: "completed"`, `completedAt`; optional full `result` |
+| `subagents:workflow:failed` | A workflow fails or is cancelled | `id`, `name`, `sessionId`, `cwd`, `status: "failed" \| "killed"`, `completedAt`; optional `error` |
 | `subagents:created` | `Agent`-tool background spawn, a detached resume, or a foreground `Agent` call handed to the background (after its `started`) — **not** cross-extension RPC, scheduler, or `@handle` spawns, which are first seen at `subagents:started` | `id`, `type`, `description`, `isBackground` (always `true`) |
 | `subagents:started` | Agent transitions to running (including queued→running) | `id`, `type`, `description` |
 | `subagents:completed` | Agent finished successfully (background and foreground) | `id`, `type`, `description`, `status`, `durationMs`, `tokens` (display total, `{ input, output, total }` — see the note below), `usage` (the run's spend as a pi `Usage`: token components including `cacheRead`, plus `cost.total` in USD; absent when nothing was spent), `toolUses`, `result` |
@@ -826,6 +830,8 @@ The four agent-lifecycle events — `subagents:started`, `:completed`, `:failed`
 `tokens.total` = `input + output + cacheWrite`. `cacheRead` is excluded — each turn's `cacheRead` is the cumulative cached prefix re-read on that one API call, so summing per-message would over-count it as a measure of work done. Use `contextUsage.percent` (surfaced as `(NN%)` in the widget) for current context size.
 
 `usage` answers the other question — what was billed — and so does include `cacheRead`, because the prefix really is re-read and re-charged on every call. It is a pi `Usage`, the same shape pi puts on `ToolResultEvent` and `AssistantMessage`, so `usage.cost.total` is where a listener already expects the money and anything pi adds to `Usage` arrives without a change here. Neither field derives from the other; `tokens` is a view model, `usage` is the data.
+
+Workflow events expose the existing ordered progress stream, including typed agent updates and text logs, plus the full final return value. They are live, observation-only events with no replay or automatic persistence. See [Observing workflows](docs/rpc.md#observing-workflows) for the contract, shutdown limits and an example recorder.
 
 ## Cross-Extension RPC
 
@@ -1082,6 +1088,7 @@ src/
     progress.ts       # Progress event log and every derived view of it (pure)
     host.ts           # WorkflowHost adapter over AgentManager
     task.ts           # local_workflow task record and batched progress updates
+    events.ts         # Workflow lifecycle/progress event payloads and detached snapshots
     tool-description.ts # Model-facing description carrying the orchestration patterns
   ui/
     agent-widget.ts       # Persistent widget: spinners, activity, status icons, theming
