@@ -19,7 +19,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { initTheme } from "@earendil-works/pi-coding-agent";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { AgentManager } from "../src/agent-manager.js";
+import { AgentManager } from "../src/agent-manager.js";
 import { SUBAGENT_TOOL_NAMES } from "../src/agent-runner.js";
 import { NO_FALLBACK, registerAgents, setFallbackSubagent } from "../src/agent-types.js";
 import subagentsExtension, { WORKFLOW_ENTRY_TYPE, WORKFLOW_FILE_FLAG } from "../src/index.js";
@@ -926,6 +926,9 @@ describe("SubagentWorkflow tool — script vs scriptPath vs name", () => {
 
     expect(textOf(result)).toMatch(/must begin with .export const meta/);
     expect(textOf(result)).not.toMatch(/started/);
+    expect(booted.pi.events.emit.mock.calls.filter(
+      ([channel]: [string]) => channel.startsWith("subagents:workflow:"),
+    )).toHaveLength(0);
   });
 
   it("names the workflow on the call line", () => {
@@ -967,6 +970,89 @@ describe("SubagentWorkflow tool — script vs scriptPath vs name", () => {
     expect(card).toContain("done");
   });
 
+  it("emits correlated workflow events with progress and the full returned result", async () => {
+    const args = { runId: "review-123", nested: { head: "abc" } };
+    const report = "finding ".repeat(1000);
+    const script = `${inlineScript}phase("Research"); log("inspecting"); return { runId: args.runId, report: ${JSON.stringify(report)} };`;
+    const result = await tools.get("SubagentWorkflow").execute(
+      "tc-events", { script, args }, undefined, undefined, workflowCtx(),
+    );
+    const id = startedTaskId(result);
+    await awaitNotification(id);
+
+    const emitted = booted.pi.events.emit.mock.calls.filter(
+      ([channel]: [string]) => channel.startsWith("subagents:workflow:"),
+    );
+    expect(emitted[0]).toEqual([
+      "subagents:workflow:started",
+      expect.objectContaining({
+        id, name: "from-inline", sessionId: "s1", cwd: hermetic.dir,
+        toolCallId: "tc-events", startedAt: expect.any(Number), args,
+      }),
+    ]);
+    const entries = emitted
+      .filter(([channel]: [string]) => channel === "subagents:workflow:progress")
+      .flatMap(([, payload]: [string, { entries: unknown[] }]) => payload.entries);
+    expect(entries).toContainEqual({ type: "workflow_phase", index: 0, title: "Research" });
+    expect(entries).toContainEqual({ type: "workflow_log", message: "inspecting" });
+    expect(emitted.at(-1)).toEqual([
+      "subagents:workflow:completed",
+      expect.objectContaining({
+        id, name: "from-inline", sessionId: "s1", cwd: hermetic.dir,
+        status: "completed", completedAt: expect.any(Number),
+        result: { runId: args.runId, report },
+      }),
+    ]);
+    expect(emitted.filter(([channel]: [string]) => channel === "subagents:workflow:completed")).toHaveLength(1);
+  });
+
+  it("keeps running and notifying when the event emitter throws", async () => {
+    booted.pi.events.emit.mockImplementation((channel: string) => {
+      if (channel.startsWith("subagents:workflow:")) throw new Error("observer unavailable");
+    });
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    const result = await tools.get("SubagentWorkflow").execute(
+      "tc-observer", { script: `${inlineScript}log("working"); return "still complete";` },
+      undefined, undefined, workflowCtx(),
+    );
+    const sent = await awaitNotification(startedTaskId(result));
+    expect(String(sent[0].content)).toContain("<result>still complete</result>");
+  });
+
+  it("emits a parallel agent's completion while its sibling is still running", async () => {
+    let releaseSlow = () => {};
+    const slow = new Promise<void>(resolve => { releaseSlow = resolve; });
+    vi.spyOn(AgentManager.prototype, "spawnAndWait").mockImplementation(async (...call) => {
+      const prompt = call[3];
+      const child = record({ id: prompt, result: `${prompt} result` });
+      call[5]?.(child.id);
+      if (prompt === "slow") await slow;
+      return { id: child.id, record: child };
+    });
+    const result = await tools.get("SubagentWorkflow").execute(
+      "tc-parallel-events",
+      { script: `${inlineScript}return await Promise.all([agent("fast", {label: "fast"}), agent("slow", {label: "slow"})]);` },
+      undefined, undefined, workflowCtx(),
+    );
+    const progress = () => booted.pi.events.emit.mock.calls
+      .filter(([channel]: [string]) => channel === "subagents:workflow:progress")
+      .flatMap(([, payload]: [string, { entries: unknown[] }]) => payload.entries);
+    try {
+      await vi.waitFor(() => expect(progress()).toContainEqual(expect.objectContaining({
+        type: "workflow_agent", label: "fast", state: "done",
+      })), { timeout: 10_000 });
+      expect(progress()).not.toContainEqual(expect.objectContaining({ label: "slow", state: "done" }));
+      expect(booted.pi.events.emit.mock.calls.some(
+        ([channel]: [string]) => channel === "subagents:workflow:completed",
+      )).toBe(false);
+    } finally {
+      releaseSlow();
+      await awaitNotification(startedTaskId(result));
+    }
+    expect(progress()).toContainEqual(expect.objectContaining({ label: "slow", state: "done" }));
+  });
+
   /** Wait for the completion notification a background run sends for `taskId`. */
   async function awaitNotification(taskId: string) {
     await vi.waitFor(
@@ -994,6 +1080,9 @@ describe("SubagentWorkflow tool — script vs scriptPath vs name", () => {
 
     const sent = await awaitNotification(startedTaskId(result));
     expect(String(sent[0].content)).toContain("<status>Stopped</status>");
+    expect(booted.pi.events.emit).toHaveBeenCalledWith("subagents:workflow:failed", expect.objectContaining({
+      id: startedTaskId(result), status: "killed", error: "Workflow aborted.",
+    }));
   });
 
   it("reports a script that threw, rather than a run that quietly ended", async () => {
@@ -1009,6 +1098,9 @@ describe("SubagentWorkflow tool — script vs scriptPath vs name", () => {
     // The reason has to be the *result* too, not only the status line — that is
     // what the collapsed notification row shows.
     expect(String(sent[0].details.resultPreview)).toContain("script blew up");
+    expect(booted.pi.events.emit).toHaveBeenCalledWith("subagents:workflow:failed", expect.objectContaining({
+      id: startedTaskId(result), status: "failed", error: expect.stringContaining("script blew up"),
+    }));
   });
 
   it("reports a run that could not start at all", async () => {
@@ -1023,6 +1115,9 @@ describe("SubagentWorkflow tool — script vs scriptPath vs name", () => {
     const sent = await awaitNotification(startedTaskId(result));
     expect(String(sent[0].content)).toContain("control characters");
     expect(sent[0].details).toMatchObject({ status: "error" });
+    expect(booted.pi.events.emit).toHaveBeenCalledWith("subagents:workflow:failed", expect.objectContaining({
+      id: startedTaskId(result), status: "failed", error: expect.stringContaining("control characters"),
+    }));
   });
 });
 
@@ -1166,6 +1261,15 @@ describe("--subagents-workflow-file", () => {
     expect(sent, "the run's outcome must reach the model").toBeTruthy();
     expect(sent![1]).toMatchObject({ deliverAs: "nextTurn" });
     expect(String(sent![0].content)).toContain("<result>all clear</result>");
+    expect(booted.pi.events.emit).toHaveBeenCalledWith("subagents:workflow:started", expect.objectContaining({
+      name: "from-file", sessionId: "s1", cwd: hermetic.dir, scriptPath: path,
+    }));
+    expect(booted.pi.events.emit).toHaveBeenCalledWith("subagents:workflow:progress", expect.objectContaining({
+      entries: [{ type: "workflow_log", message: "scanned" }],
+    }));
+    expect(booted.pi.events.emit).toHaveBeenCalledWith("subagents:workflow:completed", expect.objectContaining({
+      name: "from-file", status: "completed", result: "all clear",
+    }));
   });
 
   it("renders the persisted entry through the shared workflow card layout", async () => {

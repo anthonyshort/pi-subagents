@@ -6,6 +6,37 @@ The thing worth understanding up front is that **the bus is in-process.** Every 
 
 For the channel list, the reply envelope, the per-channel snippets and the event table, see [`README.md`](../README.md#cross-extension-rpc). This document is the reference README does not have room for: the complete spawn-option surface, every error string, the notification race, the registry, and what protocol version `2` does and does not promise.
 
+## Observing workflows
+
+Workflows launched by `SubagentWorkflow` or `--subagents-workflow-file` emit `subagents:workflow:started`, `:progress`, `:completed` and `:failed`. These are observation events, separate from the top-level agent lifecycle and the request/reply RPC channels. They do not let a listener start, stop, steer or consume a workflow.
+
+Every payload contains `id` (the workflow run ID), `name`, `sessionId` and `cwd`. The payload interfaces and channel-to-payload map are exported from `src/workflow/events.ts` (also built to `dist/workflow/events.js`). Additional fields are:
+
+| Event | Fields |
+|---|---|
+| `subagents:workflow:started` | `startedAt` in Unix milliseconds; optional `args`, `scriptPath`, `toolCallId`, `resumedFrom` |
+| `subagents:workflow:progress` | `entries`: the existing ordered batch of `WorkflowEntry` records |
+| `subagents:workflow:completed` | `status: "completed"`, `completedAt` in Unix milliseconds, optional `result`: the complete script return value, without notification-preview truncation |
+| `subagents:workflow:failed` | `status: "failed"` for execution errors or `"killed"` for cancellation, `completedAt` in Unix milliseconds, optional `error` |
+
+Subscribe from `session_start`, filter by `sessionId` when sharing a bus, and release subscriptions on `session_shutdown`. For CLI-flag workflows, load the observer before pi-subagents: their launch starts in pi-subagents' own `session_start`, so a later handler misses `started`. A run emits `started` before its first progress batch, then exactly one terminal event after its state is settled. Invalid tool parameters or metadata rejected before a run is created emit no workflow events. A nested `workflow()` call belongs to the outer run and does not emit a second lifecycle. A resumed run has a new ID and `resumedFrom` identifies the earlier attempt.
+
+`entries` preserves the existing discriminated union: `workflow_phase` names a group, `workflow_agent` carries structured agent state and activity, and `workflow_log` carries a text message. Agent records update by `index`; the latest record replaces the earlier one. Keep logs for context, and use the structured agent records for status. Agent completion does not establish that a script accepted its result or that the entire workflow succeeded.
+
+Payloads are detached snapshots of the task's state. Treat them as read-only: the in-process bus shares one event payload between listeners. Pi isolates synchronous listener errors and rejected promises; the workflow does not wait for listeners or for their storage writes. Events have no replay or persistence, so attach before launching work. Shutdown delivery is best effort: the existing shutdown path aborts detached workflows without waiting for their terminal notifications, and abrupt process exit can lose the final event. A durable observer should reconcile unfinished records when its owning process restarts.
+
+The optional [`examples/workflow-events.ts`](../examples/workflow-events.ts) extension records events as JSON lines in `<cwd>/.pi/workflow-events.jsonl`. Load it first with `pi -e ./examples/workflow-events.ts -e ./src/index.ts`. It writes synchronously and contains no model calls. Arguments, logs and full results may contain private material; the example creates its output with owner-only permissions. It records runs that finish during the session and does not guarantee terminal records during shutdown. Keep the output ignored by Git and apply your own retention policy.
+
+To try the checkout without changing an installed package, use a separate profile and explicitly load just these two extensions:
+
+```bash
+PI_CODING_AGENT_DIR=/tmp/pi-workflow-preview-profile ./node_modules/.bin/pi \
+  --offline --no-extensions --no-mcp --no-skills --no-context-files --no-session \
+  -e ./examples/workflow-events.ts -e ./src/index.ts
+```
+
+Run this from the checkout. The profile has its own provider configuration and sign-ins; it does not borrow the normal profile's credentials. Request a workflow after configuring that profile, then inspect `.pi/workflow-events.jsonl`. No package release or installation is needed.
+
 ## Spawn options
 
 `subagents:rpc:spawn` forwards `options` to `AgentManager.spawn` — but not verbatim. The manager's `spawn` behind the RPC is `spawnTopLevel` in `src/index.ts`, which deletes internal-only fields first, and then `spawnResolved` overwrites the activity-tracker callbacks with its own. The full interface is `SpawnOptions` in `src/agent-manager.ts`; what a bus caller actually gets is three different things.
